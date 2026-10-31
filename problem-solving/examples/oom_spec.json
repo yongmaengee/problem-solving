@@ -1,0 +1,1268 @@
+{
+ "title": "시계열 모델 OOM — 루프 2",
+ "nodes": [
+  {
+   "id": "data",
+   "label": "데이터 로딩",
+   "note": "원시 신호 1kHz, 윈도우 L=8192"
+  },
+  {
+   "id": "pre",
+   "label": "전처리",
+   "note": "정규화 · 윈도우 분할",
+   "children": [
+    {
+     "id": "norm",
+     "label": "채널 정규화"
+    },
+    {
+     "id": "win",
+     "label": "윈도우 분할",
+     "note": "stride 4096"
+    }
+   ]
+  },
+  {
+   "id": "model",
+   "label": "모델",
+   "note": "길이 L에 대해 메모리 ~L² (측정)",
+   "children": [
+    {
+     "id": "emb",
+     "label": "입력 임베딩",
+     "note": "Conv1d → d=256"
+    },
+    {
+     "id": "enc",
+     "label": "인코더 ×6",
+     "children": [
+      {
+       "id": "attn",
+       "label": "Self-attention",
+       "note": "헤드 8개",
+       "code": "q, k, v = self.qkv(x).chunk(3, dim=-1)\nscores = q @ k.transpose(-2, -1) / self.scale\nout = F.scaled_dot_product_attention(q, k, v)",
+       "hl": [
+        2
+       ],
+       "codeNote": "SDPA로 교체 (실험 브랜치)",
+       "changed": true
+      },
+      {
+       "id": "ffn",
+       "label": "FFN",
+       "note": "d → 4d → d"
+      },
+      {
+       "id": "bn",
+       "label": "BatchNorm",
+       "note": "배치 통계 사용"
+      }
+     ]
+    },
+    {
+     "id": "head",
+     "label": "분류 헤드"
+    }
+   ]
+  },
+  {
+   "id": "train",
+   "label": "학습 루프",
+   "note": "batch 16 → 4로 줄였으나 여전히 OOM",
+   "children": [
+    {
+     "id": "fwd",
+     "label": "forward"
+    },
+    {
+     "id": "bwd",
+     "label": "backward"
+    },
+    {
+     "id": "opt",
+     "label": "AdamW step"
+    }
+   ]
+  },
+  {
+   "id": "env",
+   "label": "실행 환경",
+   "note": "RTX 4090 24GB · torch 2.4"
+  }
+ ],
+ "scope": "attn",
+ "candidates": {
+  "train": [
+   {
+    "name": "기울기 누적 + bf16",
+    "source": "PyTorch AMP 문서",
+    "check": "중",
+    "diff": "공식 예시는 이미지 분류. 우리는 BatchNorm이 있는 시계열 인코더",
+    "port_code": "torch.autocast + 누적 루프 — 코드 이식 비용 거의 없음",
+    "port_condition": "BatchNorm이 마이크로배치 통계를 쓰게 됨 — 조건 일부 깨짐",
+    "outcomes": [
+     {
+      "case": "성공 — 학습이 돈다",
+      "p": 0.35,
+      "text": "유효 배치 16 유지, 메모리 절반",
+      "learn": "activation 층위로 충분했다"
+     },
+     {
+      "case": "부분 성공 — L=8192에서만 OOM",
+      "p": 0.5,
+      "text": "짧은 윈도우는 되지만 목표 길이에서 실패",
+      "learn": "L² 항이 본질 → Lens를 attention으로"
+     },
+     {
+      "case": "실패 — 여전히 OOM",
+      "p": 0.15,
+      "text": "마이크로배치 1에서도 실패",
+      "learn": "attention 행렬 하나가 한계를 넘음 — 구조 변경 필수"
+     }
+    ],
+    "reversible": true,
+    "cost_class": "light",
+    "evidence": [
+     {
+      "type": "url",
+      "label": "PyTorch AMP 문서",
+      "url": "https://pytorch.org/docs/stable/amp.html"
+     },
+     {
+      "type": "code",
+      "path": "ts_model/train.py",
+      "lines": "41-48",
+      "snippet": "for x, y in loader:\n    out = model(x)\n    loss = crit(out, y)\n    loss.backward()\n    opt.step(); opt.zero_grad()",
+      "note": "누적 없이 매 스텝 갱신 — 여기에 누적·autocast를 넣는다"
+     }
+    ]
+   },
+   {
+    "name": "gradient checkpointing",
+    "source": "Chen et al. 2016",
+    "check": "중",
+    "diff": "원 논문은 깊은 CNN. attention 행렬 자체는 줄이지 못함",
+    "port_code": "torch.utils.checkpoint로 블록 래핑",
+    "port_condition": "activation 절감만 — L² 행렬은 그대로",
+    "outcomes": [
+     {
+      "case": "성공",
+      "p": 0.25,
+      "text": "메모리 30~40% 감소",
+      "learn": "activation 비중이 컸다"
+     },
+     {
+      "case": "실패",
+      "p": 0.75,
+      "text": "attention 행렬이 지배적이라 효과 미미",
+      "learn": "Lens를 attention으로"
+     }
+    ],
+    "reversible": true,
+    "cost_class": "light",
+    "evidence": [
+     {
+      "type": "url",
+      "label": "Chen et al. 2016 (arXiv:1604.06174)",
+      "url": "https://arxiv.org/abs/1604.06174"
+     }
+    ]
+   },
+   {
+    "name": "배치 축소",
+    "closed": true
+   }
+  ]
+ },
+ "ripples": [
+  {
+   "from": "기울기 누적",
+   "to": "bn",
+   "effect": "BatchNorm 통계가 마이크로배치 기준으로 바뀜",
+   "kind": "own",
+   "certainty": "predicted"
+  },
+  {
+   "from": "bf16",
+   "to": "attn",
+   "effect": "softmax 수치 안정성 확인 필요",
+   "certainty": "predicted"
+  },
+  {
+   "from": "checkpointing",
+   "to": "env",
+   "effect": "스텝 시간 약 1.3배",
+   "certainty": "confirmed"
+  },
+  {
+   "from": "bf16",
+   "to": "data",
+   "effect": "미세 진폭 신호 정밀도 손실 가능",
+   "certainty": "weak"
+  }
+ ],
+ "table": {
+  "axes": [
+   "기대 효과",
+   "판별력",
+   "비용",
+   "완주 가능성",
+   "가역성",
+   "문제 보존도",
+   "파급 위험",
+   "근거 강도"
+  ],
+  "rows": [
+   {
+    "candidate": "기울기 누적 + bf16",
+    "scores": {
+     "기대 효과": [
+      3,
+      "L² 스케일링은 그대로"
+     ],
+     "판별력": [
+      4,
+      "실패 시 구조 층위 확정"
+     ],
+     "비용": [
+      5,
+      "설정 변경"
+     ],
+     "완주 가능성": [
+      5,
+      ""
+     ],
+     "가역성": [
+      5,
+      ""
+     ],
+     "문제 보존도": [
+      4,
+      "BN 통계 변화"
+     ],
+     "파급 위험": [
+      3,
+      "BN"
+     ],
+     "근거 강도": [
+      5,
+      "공식 문서"
+     ]
+    }
+   },
+   {
+    "candidate": "gradient checkpointing",
+    "scores": {
+     "기대 효과": [
+      3,
+      "activation만 절감"
+     ],
+     "판별력": [
+      3,
+      ""
+     ],
+     "비용": [
+      4,
+      "모듈 래핑"
+     ],
+     "완주 가능성": [
+      3,
+      "학습 30% 지연"
+     ],
+     "가역성": [
+      5,
+      ""
+     ],
+     "문제 보존도": [
+      5,
+      ""
+     ],
+     "파급 위험": [
+      4,
+      "시간만"
+     ],
+     "근거 강도": [
+      5,
+      "원 논문"
+     ]
+    }
+   }
+  ],
+  "analysis": {
+   "totals": {
+    "기울기 누적 + bf16": 34,
+    "gradient checkpointing": 32
+   },
+   "rank": [
+    "기울기 누적 + bf16",
+    "gradient checkpointing"
+   ],
+   "top_gap": 2,
+   "p_first": {
+    "기울기 누적 + bf16": 0.99,
+    "gradient checkpointing": 0.01
+   },
+   "robust": true,
+   "deciding_axes": [
+    {
+     "axis": "완주 가능성",
+     "diff": 2
+    },
+    {
+     "axis": "판별력",
+     "diff": 1
+    },
+    {
+     "axis": "비용",
+     "diff": 1
+    }
+   ],
+   "note": "1위가 가중치 변화에 견고함"
+  }
+ },
+ "ask": "측정에서 메모리가 L²로 늘었습니다. 학습 루프의 수는 경계를 미룰 뿐일 가능성이 큽니다. 기울기 누적으로 한 번 확인한 뒤 Lens를 모델 → Self-attention으로 옮길까요?",
+ "scopes": {
+  "attn": {
+   "candidates": {
+    "attn": [
+     {
+      "name": "FlashAttention (SDPA)",
+      "source": "Dao et al. 2022 / torch SDPA",
+      "check": "강",
+      "diff": "원 구현은 NLP·고정 길이. 우리는 L=8192 시계열, 마스크 없음",
+      "port_code": "F.scaled_dot_product_attention 한 줄 교체",
+      "port_condition": "수학적으로 동일 — 조건 이식 문제 없음",
+      "outcomes": [
+       {
+        "case": "성공",
+        "p": 0.8,
+        "text": "attention 메모리 O(L)로, 목표 길이 학습 가능",
+        "learn": "L² 항이 유일한 병목이었다"
+       },
+       {
+        "case": "실패 — 백엔드 미지원",
+        "p": 0.2,
+        "text": "GPU·dtype 조합에서 flash 커널이 선택되지 않음",
+        "learn": "실행 환경 블록으로 자식 Lens"
+       }
+      ],
+      "reversible": true,
+      "cost_class": "light",
+      "evidence": [
+       {
+        "type": "url",
+        "label": "FlashAttention (arXiv:2205.14135)",
+        "url": "https://arxiv.org/abs/2205.14135"
+       },
+       {
+        "type": "url",
+        "label": "torch SDPA 문서",
+        "url": "https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html"
+       },
+       {
+        "type": "code",
+        "path": "ts_model/model/attn.py",
+        "lines": "22-25",
+        "snippet": "scores = q @ k.transpose(-2, -1) / self.scale\nattn = scores.softmax(dim=-1)\nout = attn @ v",
+        "note": "이 세 줄을 SDPA 한 줄로 바꾼다"
+       }
+      ]
+     },
+     {
+      "name": "패칭 P=16",
+      "source": "PatchTST (Nie et al. 2023)",
+      "check": "중",
+      "diff": "PatchTST는 예측 과제, 우리는 분류",
+      "port_code": "임베딩·헤드 재작성 필요",
+      "port_condition": "미세 시간 패턴이 중요하면 깨짐",
+      "outcomes": [
+       {
+        "case": "성공",
+        "p": 0.6,
+        "text": "메모리·속도 모두 크게 개선",
+        "learn": "토큰 해상도에 여유가 있었다"
+       },
+       {
+        "case": "부분 성공 — 정확도 하락",
+        "p": 0.4,
+        "text": "미세 패턴 손실",
+        "learn": "패치 크기를 손잡이로 스윕"
+       }
+      ],
+      "reversible": true,
+      "cost_class": "light",
+      "evidence": [
+       {
+        "type": "url",
+        "label": "PatchTST (arXiv:2211.14730)",
+        "url": "https://arxiv.org/abs/2211.14730"
+       }
+      ]
+     },
+     {
+      "name": "선형 복잡도 구조 교체",
+      "source": "Mamba (Gu & Dao 2023)",
+      "check": "약",
+      "reversible": false,
+      "cost_class": "heavy",
+      "evidence": [
+       {
+        "type": "url",
+        "label": "Mamba (arXiv:2312.00752)",
+        "url": "https://arxiv.org/abs/2312.00752"
+       }
+      ]
+     }
+    ]
+   },
+   "ripples": [
+    {
+     "from": "패칭",
+     "to": "data",
+     "effect": "시간 해상도 1/16 — 미세 패턴 손실 가능",
+     "certainty": "predicted"
+    },
+    {
+     "from": "패칭",
+     "to": "head",
+     "effect": "입력 토큰 수 변화로 헤드 재설계",
+     "certainty": "predicted"
+    },
+    {
+     "from": "선형 복잡도",
+     "to": "train",
+     "effect": "하이퍼파라미터 재탐색 필요",
+     "kind": "own",
+     "certainty": "weak"
+    },
+    {
+     "from": "FlashAttention",
+     "to": "env",
+     "effect": "torch 2.4 SDPA 백엔드 지원 확인",
+     "certainty": "confirmed"
+    },
+    {
+     "from": "FlashAttention",
+     "to": "bn",
+     "effect": "마이크로배치 없이 원래 배치 유지 — 통계 그대로",
+     "certainty": "predicted"
+    }
+   ],
+   "table": {
+    "axes": [
+     "기대 효과",
+     "판별력",
+     "비용",
+     "완주 가능성",
+     "가역성",
+     "문제 보존도",
+     "파급 위험",
+     "근거 강도"
+    ],
+    "rows": [
+     {
+      "candidate": "FlashAttention (SDPA)",
+      "scores": {
+       "기대 효과": [
+        5,
+        "L² 메모리 → L"
+       ],
+       "판별력": [
+        4,
+        ""
+       ],
+       "비용": [
+        5,
+        "한 줄 교체"
+       ],
+       "완주 가능성": [
+        5,
+        ""
+       ],
+       "가역성": [
+        5,
+        ""
+       ],
+       "문제 보존도": [
+        5,
+        "수학적으로 동일"
+       ],
+       "파급 위험": [
+        4,
+        "백엔드 확인"
+       ],
+       "근거 강도": [
+        5,
+        "원 논문+공식 구현"
+       ]
+      }
+     },
+     {
+      "candidate": "패칭 P=16",
+      "scores": {
+       "기대 효과": [
+        5,
+        "토큰 수 1/16"
+       ],
+       "판별력": [
+        3,
+        ""
+       ],
+       "비용": [
+        3,
+        "임베딩·헤드 수정"
+       ],
+       "완주 가능성": [
+        4,
+        ""
+       ],
+       "가역성": [
+        3,
+        ""
+       ],
+       "문제 보존도": [
+        2,
+        "해상도 변화"
+       ],
+       "파급 위험": [
+        2,
+        "데이터·헤드"
+       ],
+       "근거 강도": [
+        4,
+        "시계열 SOTA 계열"
+       ]
+      }
+     },
+     {
+      "candidate": "선형 복잡도 구조 교체",
+      "scores": {
+       "기대 효과": [
+        4,
+        ""
+       ],
+       "판별력": [
+        2,
+        ""
+       ],
+       "비용": [
+        1,
+        "구조 재작성"
+       ],
+       "완주 가능성": [
+        2,
+        "재탐색 필요"
+       ],
+       "가역성": [
+        2,
+        ""
+       ],
+       "문제 보존도": [
+        2,
+        "모델 주장 변화"
+       ],
+       "파급 위험": [
+        2,
+        ""
+       ],
+       "근거 강도": [
+        3,
+        "도메인 이식 미검증"
+       ]
+      }
+     }
+    ]
+   },
+   "pull": [
+    {
+     "id": "opt",
+     "why": "메모리 절감분을 배치 확대에 쓸지 결정하는 곳"
+    }
+   ]
+  }
+ },
+ "knobs": {
+  "params": {
+   "L": [
+    1024,
+    2048,
+    4096,
+    8192
+   ],
+   "B": [
+    1,
+    2,
+    4
+   ],
+   "prec": [
+    "fp32",
+    "bf16"
+   ]
+  },
+  "metrics": [
+   "mem_gb"
+  ],
+  "points": [
+   {
+    "at": {
+     "L": 1024,
+     "B": 1,
+     "prec": "fp32"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 1.743
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 1024,
+     "B": 1,
+     "prec": "bf16"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 1.622
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 1024,
+     "B": 2,
+     "prec": "fp32"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 1.987
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 1024,
+     "B": 2,
+     "prec": "bf16"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 1.743
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 1024,
+     "B": 4,
+     "prec": "fp32"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 2.473
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 1024,
+     "B": 4,
+     "prec": "bf16"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 1.987
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 2048,
+     "B": 1,
+     "prec": "fp32"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 2.389
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 2048,
+     "B": 1,
+     "prec": "bf16"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 1.945
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 2048,
+     "B": 2,
+     "prec": "fp32"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 3.278
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 2048,
+     "B": 2,
+     "prec": "bf16"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 2.389
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 2048,
+     "B": 4,
+     "prec": "fp32"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 5.057
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 2048,
+     "B": 4,
+     "prec": "bf16"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 3.278
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 4096,
+     "B": 1,
+     "prec": "fp32"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 4.889
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 4096,
+     "B": 1,
+     "prec": "bf16"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 3.194
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 4096,
+     "B": 2,
+     "prec": "fp32"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 8.278
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 4096,
+     "B": 2,
+     "prec": "bf16"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 4.889
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 4096,
+     "B": 4,
+     "prec": "fp32"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 15.056
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 4096,
+     "B": 4,
+     "prec": "bf16"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 8.278
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 8192,
+     "B": 1,
+     "prec": "fp32"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 14.72
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 8192,
+     "B": 1,
+     "prec": "bf16"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 8.11
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 8192,
+     "B": 2,
+     "prec": "fp32"
+    },
+    "ok": false,
+    "values": {
+     "mem_gb": null
+    },
+    "err": "CUDA out of memory. Tried to allocate"
+   },
+   {
+    "at": {
+     "L": 8192,
+     "B": 2,
+     "prec": "bf16"
+    },
+    "ok": true,
+    "values": {
+     "mem_gb": 14.72
+    },
+    "err": null
+   },
+   {
+    "at": {
+     "L": 8192,
+     "B": 4,
+     "prec": "fp32"
+    },
+    "ok": false,
+    "values": {
+     "mem_gb": null
+    },
+    "err": "CUDA out of memory. Tried to allocate"
+   },
+   {
+    "at": {
+     "L": 8192,
+     "B": 4,
+     "prec": "bf16"
+    },
+    "ok": false,
+    "values": {
+     "mem_gb": null
+    },
+    "err": "CUDA out of memory. Tried to allocate"
+   }
+  ]
+ },
+ "excluded": [
+  "pre"
+ ],
+ "problem": [
+  "model",
+  "train"
+ ],
+ "sprints": [
+  {
+   "n": 1,
+   "stage": "정렬",
+   "lens": "train",
+   "goal": "사용자의 문제 인식과 시도 이력 정렬",
+   "status": "done",
+   "started": "2026-10-31T10:20:34",
+   "blueprint": null,
+   "ended": "2026-10-31T10:20:34",
+   "summary": "배치 축소는 닫힌 길, 버전·문법은 확인됨, 전처리는 논의 제외",
+   "delta": 2.0,
+   "changes": [
+    "제외: pre",
+    "확인된 사실: torch 2.4 / CUDA 12.4 호환 확인"
+   ]
+  },
+  {
+   "n": 2,
+   "stage": "범위",
+   "lens": "train",
+   "goal": "반복 OOM 증상 묶기, 길이별 메모리 측정",
+   "status": "done",
+   "started": "2026-10-31T10:20:35",
+   "blueprint": null,
+   "ended": "2026-10-31T10:20:35",
+   "summary": "L×L 행렬이 공통 출발점",
+   "delta": 2.0,
+   "changes": [
+    "확인된 사실: 메모리 지수 1.97(제곱), 상수항 1.5GB",
+    "확인된 사실: 누수 없음(스텝별 평탄)"
+   ]
+  },
+  {
+   "n": 3,
+   "stage": "탐색",
+   "lens": "attn",
+   "goal": "L² 항을 줄이는 선행연구 탐색과 이식가능성",
+   "status": "done",
+   "started": "2026-10-31T10:20:35",
+   "blueprint": null,
+   "ended": "2026-10-31T10:26:24",
+   "summary": "FlashAttention·패칭이 유력, 선형 구조는 비용 과다",
+   "delta": 2.0,
+   "changes": [
+    "확인된 사실: SDPA flash 백엔드가 torch 2.4·4090에서 선택됨",
+    "Blueprint vNone → v1"
+   ]
+  },
+  {
+   "n": 4,
+   "stage": "결정",
+   "lens": "attn",
+   "goal": "다음 수 고르기",
+   "status": "active",
+   "started": "2026-10-31T10:26:24",
+   "blueprint": 1,
+   "_snap": {
+    "scope": "attn",
+    "candidates": {
+     "attn": [
+      {
+       "name": "FlashAttention (SDPA)",
+       "source": "Dao et al. 2022 / torch SDPA",
+       "check": "강",
+       "diff": "원 구현은 NLP·고정 길이. 우리는 L=8192 시계열, 마스크 없음",
+       "port_code": "F.scaled_dot_product_attention 한 줄 교체",
+       "port_condition": "수학적으로 동일 — 조건 이식 문제 없음",
+       "outcomes": [
+        {
+         "case": "성공",
+         "p": 0.8,
+         "text": "attention 메모리 O(L)로, 목표 길이 학습 가능",
+         "learn": "L² 항이 유일한 병목이었다"
+        },
+        {
+         "case": "실패 — 백엔드 미지원",
+         "p": 0.2,
+         "text": "GPU·dtype 조합에서 flash 커널이 선택되지 않음",
+         "learn": "실행 환경 블록으로 자식 Lens"
+        }
+       ],
+       "reversible": true,
+       "cost_class": "light"
+      },
+      {
+       "name": "패칭 P=16",
+       "source": "PatchTST (Nie et al. 2023)",
+       "check": "중",
+       "diff": "PatchTST는 예측 과제, 우리는 분류",
+       "port_code": "임베딩·헤드 재작성 필요",
+       "port_condition": "미세 시간 패턴이 중요하면 깨짐",
+       "outcomes": [
+        {
+         "case": "성공",
+         "p": 0.6,
+         "text": "메모리·속도 모두 크게 개선",
+         "learn": "토큰 해상도에 여유가 있었다"
+        },
+        {
+         "case": "부분 성공 — 정확도 하락",
+         "p": 0.4,
+         "text": "미세 패턴 손실",
+         "learn": "패치 크기를 손잡이로 스윕"
+        }
+       ],
+       "reversible": true,
+       "cost_class": "light"
+      },
+      {
+       "name": "선형 복잡도 구조 교체",
+       "source": "Mamba (Gu & Dao 2023)",
+       "check": "약",
+       "reversible": false,
+       "cost_class": "heavy"
+      }
+     ]
+    },
+    "table": {
+     "axes": [
+      "기대 효과",
+      "판별력",
+      "비용",
+      "완주 가능성",
+      "가역성",
+      "문제 보존도",
+      "파급 위험",
+      "근거 강도"
+     ],
+     "rows": [
+      {
+       "candidate": "FlashAttention (SDPA)",
+       "scores": {
+        "기대 효과": [
+         5,
+         "L² 메모리 → L"
+        ],
+        "판별력": [
+         4,
+         ""
+        ],
+        "비용": [
+         5,
+         "한 줄 교체"
+        ],
+        "완주 가능성": [
+         5,
+         ""
+        ],
+        "가역성": [
+         5,
+         ""
+        ],
+        "문제 보존도": [
+         5,
+         "수학적으로 동일"
+        ],
+        "파급 위험": [
+         4,
+         "백엔드 확인"
+        ],
+        "근거 강도": [
+         5,
+         "원 논문+공식 구현"
+        ]
+       }
+      },
+      {
+       "candidate": "패칭 P=16",
+       "scores": {
+        "기대 효과": [
+         5,
+         "토큰 수 1/16"
+        ],
+        "판별력": [
+         3,
+         ""
+        ],
+        "비용": [
+         3,
+         "임베딩·헤드 수정"
+        ],
+        "완주 가능성": [
+         4,
+         ""
+        ],
+        "가역성": [
+         3,
+         ""
+        ],
+        "문제 보존도": [
+         2,
+         "해상도 변화"
+        ],
+        "파급 위험": [
+         2,
+         "데이터·헤드"
+        ],
+        "근거 강도": [
+         4,
+         "시계열 SOTA 계열"
+        ]
+       }
+      },
+      {
+       "candidate": "선형 복잡도 구조 교체",
+       "scores": {
+        "기대 효과": [
+         4,
+         ""
+        ],
+        "판별력": [
+         2,
+         ""
+        ],
+        "비용": [
+         1,
+         "구조 재작성"
+        ],
+        "완주 가능성": [
+         2,
+         "재탐색 필요"
+        ],
+        "가역성": [
+         2,
+         ""
+        ],
+        "문제 보존도": [
+         2,
+         "모델 주장 변화"
+        ],
+        "파급 위험": [
+         2,
+         ""
+        ],
+        "근거 강도": [
+         3,
+         "도메인 이식 미검증"
+        ]
+       }
+      }
+     ]
+    },
+    "problem": [
+     "model",
+     "train"
+    ],
+    "excluded": [
+     "pre"
+    ],
+    "closed": [],
+    "measured": 24,
+    "facts": [
+     "torch 2.4 / CUDA 12.4 호환 확인",
+     "메모리 지수 1.97(제곱), 상수항 1.5GB",
+     "누수 없음(스텝별 평탄)",
+     "SDPA flash 백엔드가 torch 2.4·4090에서 선택됨"
+    ],
+    "blueprint": 1
+   }
+  }
+ ],
+ "origin": "train",
+ "lens_path": [
+  {
+   "at": "train",
+   "why": "Sprint 1 · 정렬 — 사용자의 문제 인식과 시도 이력 정렬"
+  },
+  {
+   "at": "train",
+   "why": "Sprint 2 · 범위 — 반복 OOM 증상 묶기, 길이별 메모리 측정"
+  },
+  {
+   "at": "attn",
+   "why": "Sprint 3 · 탐색 — L² 항을 줄이는 선행연구 탐색과 이식가능성"
+  },
+  {
+   "at": "attn",
+   "why": "Sprint 4 · 결정 — 다음 수 고르기"
+  }
+ ],
+ "facts": [
+  "torch 2.4 / CUDA 12.4 호환 확인",
+  "메모리 지수 1.97(제곱), 상수항 1.5GB",
+  "누수 없음(스텝별 평탄)",
+  "SDPA flash 백엔드가 torch 2.4·4090에서 선택됨"
+ ],
+ "blueprint": {
+  "version": 1,
+  "code_ref": "7f3c2e1",
+  "updated": "2026-10-31T10:20:35",
+  "changed": [
+   "attn"
+  ],
+  "added": [],
+  "removed": []
+ },
+ "relations": [
+  {
+   "a": "기울기 누적 + bf16",
+   "b": "gradient checkpointing",
+   "type": "combine",
+   "certainty": "confirmed"
+  },
+  {
+   "a": "FlashAttention (SDPA)",
+   "b": "패칭 P=16",
+   "type": "combine",
+   "certainty": "predicted"
+  },
+  {
+   "a": "패칭 P=16",
+   "b": "선형 복잡도 구조 교체",
+   "type": "conflict",
+   "certainty": "weak"
+  }
+ ],
+ "proposals": [
+  {
+   "id": "p1",
+   "name": "채널별 다운샘플링 후 attention",
+   "change": "입력 임베딩 앞에서 채널마다 stride 4로 줄인 뒤 attention",
+   "expect": "메모리 1/16, 저주파 패턴은 유지",
+   "evidence": "",
+   "lens": "attn",
+   "status": "pending"
+  }
+ ],
+ "requests": [
+  {
+   "id": "attn-acc",
+   "lens": "attn",
+   "type": "fill",
+   "question": "지금 후보들은 메모리만 줄입니다. 정확도를 지키며 시도해 보고 싶은 방향이 있으면 채워 주세요",
+   "why": "바꾸면 안 되는 것(분류 정확도)이 아직 정해지지 않았습니다",
+   "fields": [
+    {
+     "key": "floor",
+     "label": "지켜야 할 정확도 하한",
+     "placeholder": "예) 검증 F1 0.82 이상"
+    },
+    {
+     "key": "idea",
+     "label": "떠오르는 방향",
+     "placeholder": "선택"
+    }
+   ]
+  }
+ ],
+ "layout": "row",
+ "layout_why": "모듈 5개가 한 방향으로 흐르는 학습 파이프라인 — 가로가 흐름을 그대로 보여 줌",
+ "overview": {
+  "problem": "시계열 분류 모델을 목표 길이(L=8192)로 학습하면 OOM이 반복된다",
+  "observed": "배치를 16→4로 줄여도 OOM, 짧은 윈도우에서는 학습이 됨",
+  "interpretation": "모델이 이 길이를 다루기엔 너무 큰 것 같다 (사용자)",
+  "closed": [
+   "배치 축소",
+   "라이브러리 버전·문법 점검"
+  ],
+  "constraints": [
+   "RTX 4090 24GB 한 장",
+   "분류 정확도는 유지 (하한은 아직 미정)"
+  ],
+  "next": "FlashAttention(SDPA)로 교체해 L=8192에서 메모리를 다시 잰다"
+ }
+}
