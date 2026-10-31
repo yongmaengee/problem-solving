@@ -3,7 +3,7 @@
 막힌 문제를 **해설하지 않고 수를 두어** 푸는 Claude 스킬입니다.
 코드를 정보 흐름대로 펼친 **Blueprint** 위에서 **Lens**를 옮겨 가며, 근거 있는 후보를 찾고, 두면 생길 일을 견주어, 다음 수를 고릅니다.
 
-! [Lens와 옆에 이어 붙는 카드](docs/images/02-lens.png)
+![Lens와 옆에 이어 붙는 카드](problem-solving/docs/images/02-lens.png)
 
 OOM, 학습 발산·미수렴, 반복되는 에러, 성능 정체, 재현 실패, 논문 방법 이식, 막힌 설계 결정에 씁니다.
 "왜 안 되지", "계속 같은 문제가 나", "해 볼 건 다 해 봤는데" 같은 말이 나오면 스킬을 부르지 않아도 동작합니다.
@@ -39,11 +39,11 @@ ts_model/train.py 돌리면 계속 OOM 나. 배치 줄여 봤는데 안 돼.
 ### Blueprint와 지금 상황
 코드를 정보가 흐르는 순서대로 블록으로 펼칩니다. 빗금 테두리가 문제로 정한 곳이고, 왼편 바깥의 「지금 상황」이 문제·사실·현재 스프린트·가장 앞선 수를 한눈에 정리합니다.
 
-![Blueprint 전체와 지금 상황](docs/images/01-blueprint.png)
+![Blueprint 전체와 지금 상황](problem-solving/docs/images/01-blueprint.png)
 
 배치는 그리기 전에 코드와 문제를 보고 정합니다. 짧은 파이프라인은 가로, 긴 순차 흐름은 세로, 갈래가 많은 시스템은 격자입니다.
 
-![가로·세로·격자 배치](docs/images/06-layouts.png)
+![가로·세로·격자 배치](problem-solving/docs/images/06-layouts.png)
 
 ### Lens
 Lens는 Blueprint 위를 움직이는 초점입니다. 안은 선명하고 바깥은 흐려집니다. 진행 중인 스프린트의 Lens는 테두리가 천천히 돕니다.
@@ -57,17 +57,17 @@ Lens는 Claude가 코드의 처리 흐름을 따라 옮기되, 문제 영역의 
 ### 영향이 닿는 곳
 Lens 단위에서 관련된 다른 프로세스의 블록을 Lens 위로 꺼내 놓습니다. 후보에 마우스를 올리면 그 수가 영향을 주는 블록까지 선이 흐르고, 원래 자리까지 점선이 이어집니다.
 
-![후보에 마우스를 올렸을 때의 영향선](docs/images/04-influence.png)
+![후보에 마우스를 올렸을 때의 영향선](problem-solving/docs/images/04-influence.png)
 
 ### 이 수를 두면
 후보를 누르면 갈래가 펼쳐집니다. 출처 및 근거(논문 링크, 내부 코드 위치), 이식 가능성, 성공·부분 성공·실패의 확률과 각 경우에 얻는 정보, 파급 영향이 선으로 이어집니다.
 
-![후보의 갈래 펼침](docs/images/03-branches.png)
+![후보의 갈래 펼침](problem-solving/docs/images/03-branches.png)
 
 ### 정해 주실 것
 Claude는 사용자의 판단이 결과를 바꾸는 지점에서만 묻습니다. 답이 없으면 정해진 범위 안에서 스스로 고르고, 그 사실을 다음 답의 첫 줄에 밝힙니다. 언제든 완전히 새로운 시도를 제안할 수 있고, 제안은 다음 스프린트에서 다른 후보와 똑같이 따집니다.
 
-<img src="docs/images/05-ask.png" alt="결정 요청과 새 시도 제안" width="320">
+<img src="problem-solving/docs/images/05-ask.png" alt="결정 요청과 새 시도 제안" width="320">
 
 ### 선의 문법
 선 모양은 얼마나 확실한지를, 색은 무슨 관계인지를 나타냅니다.
